@@ -1,7 +1,7 @@
 """Step 1: facts topic + script generator (English / Bangla) using Gemini.
 
 Usage: python generate_script.py --lang en|bn
-Env:   GEMINI_API_KEY (required), GEMINI_MODEL (optional, default gemini-2.5-flash)
+Env:   GEMINI_API_KEY (required), GEMINI_MODEL (optional; if empty the newest available flash model is auto-picked)
 Out:   output/script_<lang>.json   and   history/topics_<lang>.json
 """
 import argparse
@@ -14,8 +14,7 @@ from pathlib import Path
 
 import requests
 
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+API = "https://generativelanguage.googleapis.com/v1beta/models"
 LANGS = {"en": "English", "bn": "Bengali (বাংলা)"}
 OUT = Path("output")
 HISTORY = Path("history")
@@ -69,6 +68,28 @@ Return ONLY JSON with this shape:
   "thumbnail_text": str, "description": str, "tags": [str], "sources": [str]}}"""
 
 
+def list_candidates(headers: dict) -> list[str]:
+    """Model names to try, newest flash first. GEMINI_MODEL overrides."""
+    forced = os.environ.get("GEMINI_MODEL", "").strip()
+    if forced:
+        return [forced]
+    r = requests.get(f"{API}?pageSize=200", headers=headers, timeout=60)
+    r.raise_for_status()
+    skip = ("lite", "image", "tts", "preview", "exp", "live", "thinking", "audio", "native", "robotics", "computer")
+    names = [
+        m["name"].split("/")[-1]
+        for m in r.json().get("models", [])
+        if "generateContent" in m.get("supportedGenerationMethods", [])
+    ]
+    flash = [n for n in names if n.startswith("gemini-") and "flash" in n and not any(x in n for x in skip)]
+    flash.sort(key=lambda n: tuple(int(x) for x in re.findall(r"\d+", n)), reverse=True)
+    lite = [n for n in names if "flash-lite" in n and "preview" not in n and "exp" not in n]
+    out = flash + [n for n in lite if n not in flash]
+    if not out:
+        sys.exit("No usable Gemini model found for this API key. Models seen: " + ", ".join(names[:20]))
+    return out
+
+
 def call_gemini(prompt: str) -> dict:
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
@@ -78,16 +99,22 @@ def call_gemini(prompt: str) -> dict:
         "generationConfig": {"responseMimeType": "application/json", "temperature": 1.0},
     }
     headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
-    for attempt in range(4):
-        r = requests.post(URL, headers=headers, json=body, timeout=120)
-        if r.status_code in (429, 500, 502, 503, 504):
-            time.sleep(10 * (attempt + 1))
+    for model in list_candidates(headers):
+        for attempt in range(3):
+            r = requests.post(f"{API}/{model}:generateContent", headers=headers, json=body, timeout=120)
+            if r.status_code in (500, 502, 503, 504) or (r.status_code == 429 and attempt < 2):
+                time.sleep(10 * (attempt + 1))
+                continue
+            break
+        if r.status_code in (404, 429, 403):
+            print(f"model {model}: HTTP {r.status_code}, trying next")
             continue
         r.raise_for_status()
+        print(f"using model {model}")
         text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
         text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
         return json.loads(text)
-    sys.exit("Gemini kept failing (rate limit or server error). Try again later.")
+    sys.exit("No Gemini model worked (404/quota). Check the API key and free-tier limits.")
 
 
 def validate(data: dict) -> list[str]:

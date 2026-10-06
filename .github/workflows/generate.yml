@@ -1,0 +1,56 @@
+name: generate-script
+
+on:
+  workflow_dispatch:
+    inputs:
+      lang:
+        description: "en or bn"
+        default: "en"
+  schedule:
+    - cron: "0 6 * * *"   # 06:00 UTC daily -> English
+    - cron: "0 7 * * *"   # 07:00 UTC daily -> Bangla
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Pick language
+        id: lang
+        env:
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          LANG_INPUT: ${{ github.event.inputs.lang }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then L="$LANG_INPUT"
+          elif [ "$SCHEDULE" = "0 7 * * *" ]; then L=bn
+          else L=en; fi
+          echo "lang=$L" >> "$GITHUB_OUTPUT"
+
+      - name: Generate script
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python generate_script.py --lang "${{ steps.lang.outputs.lang }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: script-${{ steps.lang.outputs.lang }}
+          path: output/
+
+      - name: Save topic history
+        run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add history
+          git commit -m "update topic history" || echo "nothing to commit"
+          git push

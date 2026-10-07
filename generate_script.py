@@ -106,7 +106,7 @@ def call_gemini(prompt: str) -> dict:
                 time.sleep(10 * (attempt + 1))
                 continue
             break
-        if r.status_code in (404, 429, 403):
+        if r.status_code in (403, 404, 429, 500, 502, 503, 504):
             print(f"model {model}: HTTP {r.status_code}, trying next")
             continue
         r.raise_for_status()

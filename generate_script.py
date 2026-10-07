@@ -24,7 +24,7 @@ BAD_OPENERS = (
     "স্বাগতম", "হ্যালো", "আসসালামু", "নমস্কার", "আজকে আমরা", "আজ আমরা", "এই ভিডিওতে",
 )
 HOOK_SIGNAL = re.compile(
-    r"[0-9০-৯]|\?|কেন|কীভাবে|কেউ|কখনো|কখনও|\bwhy\b|\bhow\b|\bnever\b|\bnobody\b|\bno one\b",
+    r"[0-9০-৯]|\?|কেন|কীভাবে|কেউ|কখনো|কখনও|\bwhy\b|\bhow\b|\bnever\b|\bnobody\b|\bno one\b|\bonly\b|\bfirst\b|\blargest\b|\bsmallest\b|\boldest\b|\bfastest\b|\bthan\b",
     re.IGNORECASE,
 )
 
@@ -100,21 +100,34 @@ def call_gemini(prompt: str) -> dict:
     }
     headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
     for model in list_candidates(headers):
-        for attempt in range(3):
-            r = requests.post(f"{API}/{model}:generateContent", headers=headers, json=body, timeout=120)
-            if r.status_code in (500, 502, 503, 504) or (r.status_code == 429 and attempt < 2):
-                time.sleep(10 * (attempt + 1))
+        r = None
+        for attempt in range(2):
+            try:
+                r = requests.post(f"{API}/{model}:generateContent", headers=headers, json=body, timeout=90)
+            except requests.RequestException as e:
+                print(f"model {model}: {type(e).__name__}, trying next")
+                r = None
+                break
+            if r.status_code == 429 and attempt == 0:
+                time.sleep(10)
                 continue
             break
+        if r is None:
+            continue
         if r.status_code in (403, 404, 429, 500, 502, 503, 504):
             print(f"model {model}: HTTP {r.status_code}, trying next")
             continue
         r.raise_for_status()
+        try:
+            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+            data = json.loads(text)
+        except (KeyError, IndexError, ValueError):
+            print(f"model {model}: unreadable answer, trying next")
+            continue
         print(f"using model {model}")
-        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-        text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
-        return json.loads(text)
-    sys.exit("No Gemini model worked (404/quota). Check the API key and free-tier limits.")
+        return data
+    sys.exit("No Gemini model worked (busy/timeout/quota). Run again in a few minutes.")
 
 
 def validate(data: dict) -> list[str]:

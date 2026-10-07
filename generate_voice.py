@@ -10,9 +10,9 @@ Env:   GEMINI_API_KEY        (required)
        GEMINI_VOICE          (optional prebuilt voice name, default Charon)
        TTS_STYLE             (optional style prefix; default empty so nothing but the script is spoken)
        VOICE_CLEAN           (optional, 0 = keep raw audio; default 1 = trim tail hiss + fades)
-       VOICE_TAIL_THRESHOLD  (optional, default 0.12; raise to 0.2 to cut more of a quiet hiss)
+       VOICE_TAIL_THRESHOLD  (optional, default 0.2; raise to 0.3 to cut more of a quiet hiss)
        VOICE_GATE_THRESHOLD  (optional, default 0 = off; whole-segment hiss gate)
-       VOICE_TAIL_GATE       (optional, default 0.2; hiss gate for the last 0.8 s of each segment only; 0 = off)
+       VOICE_TAIL_GATE       (optional, default 0.3; hiss gate for the last 0.8 s of each segment only; 0 = off)
        GEN_BUDGET_SECONDS    (optional total time budget, default 900)
 
 Robustness: busy/limited/unavailable models are skipped, rounds repeat with waiting,
@@ -43,9 +43,9 @@ MAX_CHUNK_BYTES = 3000   # service limit is about 4000 bytes per text field
 GAP_SECONDS = 0.35       # silence between segments
 MIN_AUDIO_SECONDS = 0.3
 CLEAN = os.environ.get("VOICE_CLEAN", "1") != "0"          # trim tail hiss + fades
-TAIL_RATIO = float(os.environ.get("VOICE_TAIL_THRESHOLD", "0.12"))  # raise (e.g. 0.2) to cut more
+TAIL_RATIO = float(os.environ.get("VOICE_TAIL_THRESHOLD", "0.2"))  # raise (e.g. 0.2) to cut more
 GATE_RATIO = float(os.environ.get("VOICE_GATE_THRESHOLD", "0"))     # whole-segment gate; OFF by default (it can make speech sound rough)
-TAIL_GATE_RATIO = float(os.environ.get("VOICE_TAIL_GATE", "0.2"))   # gate applied ONLY to the last 0.8 s of each segment
+TAIL_GATE_RATIO = float(os.environ.get("VOICE_TAIL_GATE", "0.3"))   # gate applied ONLY to the last 0.8 s of each segment
 GATE_FLOOR = float(os.environ.get("VOICE_GATE_FLOOR", "0.08"))      # gain used in those quiet parts (0.08 = about -22 dB)
 
 

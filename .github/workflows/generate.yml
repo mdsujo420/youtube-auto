@@ -41,7 +41,6 @@ jobs:
       - name: Generate script
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: gemini-3.6-flash
         run: python generate_script.py --lang "${{ steps.lang.outputs.lang }}"
 
       - uses: actions/upload-artifact@v4

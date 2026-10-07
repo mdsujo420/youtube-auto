@@ -8,9 +8,10 @@ Writes: output/voice_<lang>.wav             (whole narration, one file)
 Env:   GEMINI_API_KEY        (required)
        GEMINI_TTS_MODEL      (optional, comma list; default = auto-discover TTS models)
        GEMINI_VOICE          (optional prebuilt voice name, default Charon)
-       TTS_STYLE             (optional style prefix; set to a single space to disable)
+       TTS_STYLE             (optional style prefix; default empty so nothing but the script is spoken)
        VOICE_CLEAN           (optional, 0 = keep raw audio; default 1 = trim tail hiss + fades)
        VOICE_TAIL_THRESHOLD  (optional, default 0.12; raise to 0.2 to cut more of a quiet hiss)
+       VOICE_GATE_THRESHOLD  (optional, default 0.08; quiet parts below this share of speech level are lowered; 0 = off)
        GEN_BUDGET_SECONDS    (optional total time budget, default 900)
 
 Robustness: busy/limited/unavailable models are skipped, rounds repeat with waiting,
@@ -35,13 +36,15 @@ API = "https://generativelanguage.googleapis.com/v1beta/models"
 OUT = Path("output")
 BUDGET = int(os.environ.get("GEN_BUDGET_SECONDS", "900"))
 VOICE = os.environ.get("GEMINI_VOICE", "Charon").strip() or "Charon"
-STYLE = os.environ.get("TTS_STYLE", "Read aloud clearly, in an engaging documentary narrator voice: ")
+STYLE = os.environ.get("TTS_STYLE", "")  # empty on purpose: ONLY the script text is sent, nothing extra can be read aloud
 FALLBACK_MODELS = ["gemini-2.5-flash-preview-tts", "gemini-2.5-flash-lite-preview-tts", "gemini-2.5-pro-preview-tts"]
 MAX_CHUNK_BYTES = 3000   # service limit is about 4000 bytes per text field
 GAP_SECONDS = 0.35       # silence between segments
 MIN_AUDIO_SECONDS = 0.3
 CLEAN = os.environ.get("VOICE_CLEAN", "1") != "0"          # trim tail hiss + fades
 TAIL_RATIO = float(os.environ.get("VOICE_TAIL_THRESHOLD", "0.12"))  # raise (e.g. 0.2) to cut more
+GATE_RATIO = float(os.environ.get("VOICE_GATE_THRESHOLD", "0.08"))  # quiet parts below this share of speech level are lowered
+GATE_FLOOR = float(os.environ.get("VOICE_GATE_FLOOR", "0.08"))      # gain used in those quiet parts (0.08 = about -22 dB)
 
 
 # ----------------------------------------------------------------- text
@@ -176,6 +179,38 @@ def synth(text: str, headers: dict, candidates: list[str], deadline: float):
 
 
 # ----------------------------------------------------------------- cleanup
+def gate_quiet(b: array, rate: int, thr: float) -> None:
+    """In place: lower very quiet stretches (hiss between words/sentences) by GATE_FLOOR.
+    Frames within 60 ms of real speech are left untouched so word edges are not clipped;
+    the gain changes smoothly from frame to frame (no clicks)."""
+    frame = max(1, int(rate * 0.01))
+    nf = len(b) // frame
+    if nf < 3:
+        return
+    loud = []
+    for i in range(nf):
+        chunk = b[i * frame:(i + 1) * frame]
+        loud.append(math.sqrt(sum(x * x for x in chunk) / frame) > thr)
+    hold = 6
+    target = []
+    for i in range(nf):
+        near = any(loud[max(0, i - hold):i + hold + 1])
+        target.append(1.0 if near else GATE_FLOOR)
+    for i in range(nf):
+        g0 = target[i]
+        g1 = target[i + 1] if i + 1 < nf else target[i]
+        if g0 == 1.0 and g1 == 1.0:
+            continue
+        base = i * frame
+        for j in range(frame):
+            b[base + j] = int(b[base + j] * (g0 + (g1 - g0) * j / frame))
+    # samples after the last full frame keep the last gain
+    last = target[-1]
+    if last != 1.0:
+        for k in range(nf * frame, len(b)):
+            b[k] = int(b[k] * last)
+
+
 def clean_pcm(pcm: bytes, rate: int) -> bytes:
     """Cut the quiet hiss/noise after the last spoken word (and any at the start),
     then apply short fades so there are no clicks. 16-bit mono PCM in, same out."""
@@ -199,6 +234,8 @@ def clean_pcm(pcm: bytes, rate: int) -> bytes:
     start = max(0, loud[0] * frame - int(rate * 0.05))
     end = min(len(a), (loud[-1] + 1) * frame + int(rate * 0.12))
     b = a[start:end]
+    if GATE_RATIO > 0:
+        gate_quiet(b, rate, max(120.0, GATE_RATIO * p90))
     fade_in, fade_out = int(rate * 0.01), int(rate * 0.08)
     ln = len(b)
     for i in range(min(fade_in, ln)):

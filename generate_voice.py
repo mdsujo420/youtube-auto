@@ -10,6 +10,7 @@ Env:   GEMINI_API_KEY        (required)
        GEMINI_VOICE          (optional prebuilt voice name, default Charon)
        TTS_STYLE             (optional style prefix; default empty so nothing but the script is spoken)
        VOICE_CLEAN           (optional, 0 = keep raw audio; default 1 = trim tail hiss + fades)
+       VOICE_FADE_OUT        (optional, default 0.18 s smooth fade at the end of every segment)
        VOICE_TAIL_THRESHOLD  (optional, default 0.2; raise to 0.3 to cut more of a quiet hiss)
        VOICE_GATE_THRESHOLD  (optional, default 0 = off; whole-segment hiss gate)
        VOICE_TAIL_GATE       (optional, default 0.3; hiss gate for the last 0.8 s of each segment only; 0 = off)
@@ -44,6 +45,7 @@ GAP_SECONDS = 0.35       # silence between segments
 MIN_AUDIO_SECONDS = 0.3
 CLEAN = os.environ.get("VOICE_CLEAN", "1") != "0"          # trim tail hiss + fades
 TAIL_RATIO = float(os.environ.get("VOICE_TAIL_THRESHOLD", "0.2"))  # raise (e.g. 0.2) to cut more
+FADE_OUT_SEC = float(os.environ.get("VOICE_FADE_OUT", "0.18"))     # smooth fade at the end of every segment
 GATE_RATIO = float(os.environ.get("VOICE_GATE_THRESHOLD", "0"))     # whole-segment gate; OFF by default (it can make speech sound rough)
 TAIL_GATE_RATIO = float(os.environ.get("VOICE_TAIL_GATE", "0.3"))   # gate applied ONLY to the last 0.8 s of each segment
 GATE_FLOOR = float(os.environ.get("VOICE_GATE_FLOOR", "0.08"))      # gain used in those quiet parts (0.08 = about -22 dB)
@@ -234,7 +236,7 @@ def clean_pcm(pcm: bytes, rate: int) -> bytes:
     if not loud:
         return pcm
     start = max(0, loud[0] * frame - int(rate * 0.05))
-    end = min(len(a), (loud[-1] + 1) * frame + int(rate * 0.06))
+    end = min(len(a), (loud[-1] + 1) * frame + int(rate * 0.02))
     b = a[start:end]
     if GATE_RATIO > 0:
         gate_quiet(b, rate, max(120.0, GATE_RATIO * p90))
@@ -243,15 +245,38 @@ def clean_pcm(pcm: bytes, rate: int) -> bytes:
         tail = b[k:]
         gate_quiet(tail, rate, max(150.0, TAIL_GATE_RATIO * p90))
         b[k:] = tail
-    fade_in, fade_out = int(rate * 0.01), int(rate * 0.10)
+    fade_in, fade_out = int(rate * 0.01), int(rate * FADE_OUT_SEC)
     ln = len(b)
     for i in range(min(fade_in, ln)):
         b[i] = int(b[i] * i / fade_in)
     for i in range(min(fade_out, ln)):
-        b[ln - 1 - i] = int(b[ln - 1 - i] * i / fade_out)
+        # raised-cosine: 0 at the very last sample, 1 at fade_out samples before the end
+        b[ln - 1 - i] = int(b[ln - 1 - i] * 0.5 * (1 - math.cos(math.pi * i / fade_out)))
     if sys.byteorder == "big":
         b.byteswap()
     return b.tobytes()
+
+
+def tail_profile(pcm: bytes, rate: int) -> list[float]:
+    """Level of the last second in 100 ms steps, in dB relative to the speech level (0 = speech)."""
+    a = array("h")
+    a.frombytes(pcm[: len(pcm) // 2 * 2])
+    f20 = max(1, int(rate * 0.02))
+    n = len(a) // f20
+    if n < 5:
+        return []
+    r20 = sorted(math.sqrt(sum(x * x for x in a[i * f20:(i + 1) * f20]) / f20) for i in range(n))
+    p90 = max(r20[int(0.9 * (n - 1))], 1.0)
+    f100 = int(rate * 0.1)
+    out = []
+    for k in range(10, 0, -1):
+        end = len(a) - (k - 1) * f100
+        chunk = a[max(0, end - f100):end]
+        if not chunk:
+            continue
+        v = math.sqrt(sum(x * x for x in chunk) / len(chunk))
+        out.append(round(20 * math.log10(max(v, 1.0) / p90), 1))
+    return out
 
 
 # ----------------------------------------------------------------- wav
@@ -292,6 +317,7 @@ def main() -> None:
     deadline = time.time() + BUDGET
 
     rate = None
+    debug: dict = {}
     pcms: list[bytes] = []
     for i, seg in enumerate(segments):
         f = seg_dir / f"seg_{i:02d}.wav"
@@ -315,10 +341,12 @@ def main() -> None:
             rate = r
         elif r != rate:
             sys.exit("Inconsistent sample rates between segments.")
+        debug[i] = {"tail_db_raw": tail_profile(pcm, rate)}
         if CLEAN:
             cleaned = clean_pcm(pcm, rate)
             print(f"segment {i}: cleaned {len(pcm) / (2 * rate):.2f}s -> {len(cleaned) / (2 * rate):.2f}s")
             pcm = cleaned
+        debug[i]["tail_db_clean"] = tail_profile(pcm, rate)
         pcms.append(pcm)
 
     gap = b"\x00\x00" * int(rate * GAP_SECONDS)
@@ -328,6 +356,7 @@ def main() -> None:
         timeline.append({
             "index": i, "kind": seg["kind"], "text": seg["text"], "image_query": seg["image_query"],
             "start": round(t, 3), "end": round(t + dur, 3), "duration": round(dur, 3),
+            "debug": debug.get(i, {}),
         })
         joined.append(pcm)
         if i < len(segments) - 1:

@@ -7,16 +7,17 @@ at most one tail to clean (usually at the very end). One continuous reading also
 voice consistent. Scene boundaries are found from the pauses in the audio, so the video
 step still gets start/end seconds for every scene.
 
-Usage: python generate_voice.py --lang en|bn
-Reads: output/script_<lang>.json
-Writes: output/voice_<lang>.wav, output/timings_<lang>.json, output/voice_<lang>/req_XX.wav (raw audio, also a retry cache)
+Usage: python generate_voice.py --lang en|bn --kind long|short
+Reads: output/script_<lang>_<kind>.json
+Writes: output/voice_<lang>_<kind>.wav, output/timings_<lang>_<kind>.json, output/voice_<lang>_<kind>/req_XX.wav (raw audio, also a retry cache)
+        history/pace_<lang>.json (measured speaking pace, used by the script step to hit the target length)
 
 Env:   GEMINI_API_KEY       (required)
        GEMINI_TTS_MODEL     (optional, comma list; default = auto-discover TTS models)
        GEMINI_VOICE         (optional prebuilt voice name, default Charon)
        TTS_STYLE            (optional style prefix; default empty so nothing but the script is spoken)
        VOICE_MODE           (optional; "scene" = one request per scene like the old version; default packed)
-       VOICE_MAX_BYTES      (optional, default 3400 text bytes per request; service limit is ~4000)
+       VOICE_MAX_BYTES      (optional, default 3000 text bytes per request; service limit is ~4000)
        VOICE_CLEAN          (0 = keep raw audio; default 1 = trim tail hiss + fades)
        VOICE_FADE_OUT / VOICE_TAIL_THRESHOLD / VOICE_TAIL_GATE / VOICE_GATE_THRESHOLD  (fine tuning)
        GEN_BUDGET_SECONDS   (optional total time budget, default 900)
@@ -37,11 +38,12 @@ import requests
 
 API = "https://generativelanguage.googleapis.com/v1beta/models"
 OUT = Path("output")
-BUDGET = int(os.environ.get("GEN_BUDGET_SECONDS", "900"))
+HISTORY = Path("history")
+BUDGET = int(os.environ.get("GEN_BUDGET_SECONDS", "1800"))
 VOICE = os.environ.get("GEMINI_VOICE", "Charon").strip() or "Charon"
 STYLE = os.environ.get("TTS_STYLE", "")  # empty on purpose: ONLY the script text is sent
 FALLBACK_MODELS = ["gemini-2.5-flash-preview-tts", "gemini-2.5-flash-lite-preview-tts", "gemini-2.5-pro-preview-tts"]
-MAX_REQ_BYTES = int(os.environ.get("VOICE_MAX_BYTES", "3400"))
+MAX_REQ_BYTES = int(os.environ.get("VOICE_MAX_BYTES", "3000"))
 PACK = os.environ.get("VOICE_MODE", "packed").strip().lower() != "scene"
 GAP_SECONDS = 0.35       # silence between requests (only when the script needs more than one)
 MIN_AUDIO_SECONDS = 0.3
@@ -169,7 +171,7 @@ def synth(text: str, headers: dict, candidates: list[str], deadline: float):
                 return None
             try:
                 r = requests.post(
-                    f"{API}/{model}:generateContent", headers=headers, json=body, timeout=min(180, remaining)
+                    f"{API}/{model}:generateContent", headers=headers, json=body, timeout=min(300, remaining)
                 )
             except requests.RequestException as e:
                 print(f"[round {rnd}] {model}: {type(e).__name__}, next")
@@ -452,14 +454,17 @@ def synth_best(text: str, headers: dict, candidates: list[str], deadline: float)
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--lang", choices=["en", "bn"], required=True)
-    lang = ap.parse_args().lang
+    ap.add_argument("--kind", choices=["long", "short"], required=True)
+    args = ap.parse_args()
+    lang, kind = args.lang, args.kind
+    tag = f"{lang}_{kind}"
 
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
         sys.exit("GEMINI_API_KEY is not set")
     headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
 
-    script_path = OUT / f"script_{lang}.json"
+    script_path = OUT / f"script_{tag}.json"
     if not script_path.exists():
         sys.exit(f"{script_path} not found. Run generate_script.py first.")
     script = json.loads(script_path.read_text(encoding="utf-8"))
@@ -467,7 +472,7 @@ def main() -> None:
     reqs = plan_requests(segments)
     print(f"{len(segments)} scenes -> {len(reqs)} TTS request(s)")
 
-    seg_dir = OUT / f"voice_{lang}"
+    seg_dir = OUT / f"voice_{tag}"
     seg_dir.mkdir(parents=True, exist_ok=True)
     candidates = list_candidates(headers)
     print("tts models to try:", ", ".join(candidates), "| voice:", VOICE)
@@ -525,12 +530,32 @@ def main() -> None:
     timeline[-1]["end"] = round(total, 3)
     timeline[-1]["duration"] = round(total - timeline[-1]["start"], 3)
 
-    write_wav(OUT / f"voice_{lang}.wav", b"".join(joined), rate)
-    (OUT / f"timings_{lang}.json").write_text(
-        json.dumps({"lang": lang, "voice": VOICE, "sample_rate": rate, "total_seconds": round(total, 3),
-                    "requests": [p[3] for p in parts], "segments": timeline},
+    write_wav(OUT / f"voice_{tag}.wav", b"".join(joined), rate)
+    words = sum(len(seg["text"].split()) for seg in segments)
+    warnings = []
+    if kind == "long" and total < 485:
+        warnings.append(f"long video is {total:.0f}s, under 8 minutes: no mid-roll ads")
+    if kind == "short" and total > 178:
+        warnings.append(f"short is {total:.0f}s, over the 3-minute Shorts limit")
+    (OUT / f"timings_{tag}.json").write_text(
+        json.dumps({"lang": lang, "kind": kind, "voice": VOICE, "sample_rate": rate, "total_seconds": round(total, 3),
+                    "words": words, "warnings": warnings, "requests": [p[3] for p in parts], "segments": timeline},
                    ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"OK [{lang}] {len(segments)} scenes, {len(parts)} request(s), {total:.1f}s total")
+    # remember the real speaking pace so the next script hits its target length more exactly
+    try:
+        HISTORY.mkdir(exist_ok=True)
+        pf = HISTORY / f"pace_{lang}.json"
+        measured = words / total if total > 20 else None
+        if measured:
+            old = json.loads(pf.read_text(encoding="utf-8")).get("wps") if pf.exists() else None
+            wps = round(0.5 * old + 0.5 * measured, 3) if old else round(measured, 3)
+            pf.write_text(json.dumps({"wps": wps, "last_measured": round(measured, 3)}), encoding="utf-8")
+            print(f"speaking pace: {measured:.2f} words/s (saved {wps})")
+    except (OSError, ValueError):
+        pass
+    for w in warnings:
+        print("WARNING:", w)
+    print(f"OK [{tag}] {len(segments)} scenes, {len(parts)} request(s), {total:.1f}s total")
 
 
 if __name__ == "__main__":

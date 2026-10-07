@@ -1,12 +1,3 @@
-"""Step 2: voiceover with Gemini TTS (English / Bangla).
-
-Usage: python generate_voice.py --lang en|bn
-Reads: output/script_<lang>.json            (made by generate_script.py)
-Writes: output/voice_<lang>.wav             (whole narration, one file)
-        output/timings_<lang>.json          (start/end second of every segment, for the video step)
-        output/voice_<lang>/seg_XX.wav      (one file per segment, also used as a retry cache)
-Env:   GEMINI_API_KEY        (required)
-       GEMINI_TTS_MODEL      (optional, comma list; default = auto-discover TTS models)
 """Step 2 (v3): voiceover with Gemini TTS (English / Bangla).
 
 WHY v3: Gemini TTS sometimes leaves a hiss after the last word of EVERY audio it generates.

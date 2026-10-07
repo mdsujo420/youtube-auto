@@ -20,7 +20,7 @@ concurrency:
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -31,6 +31,13 @@ jobs:
       - name: Install
         run: |
           for i in 1 2 3; do pip install -r requirements.txt && break || sleep 15; done
+
+      - name: Install ffmpeg and fonts
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-noto-core && break || sleep 15
+          done
+          ffmpeg -version | head -1
 
       - name: Pick language
         id: lang
@@ -74,11 +81,28 @@ jobs:
           echo "All 3 voice runs failed"
           exit 1
 
+      - name: Generate videos (retries up to 3 times)
+        env:
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          SCRIPT_LANG: ${{ steps.lang.outputs.lang }}
+        run: |
+          for i in 1 2 3; do
+            python generate_video.py --lang "$SCRIPT_LANG" && exit 0
+            rc=$?
+            if [ "$rc" -eq 3 ]; then echo "Not retrying (missing or invalid image key)"; exit 3; fi
+            echo "video run $i failed; waiting 1 minute before retrying"
+            sleep 60
+          done
+          echo "All 3 video runs failed"
+          exit 1
+
       - uses: actions/upload-artifact@v4
         with:
           name: script-${{ steps.lang.outputs.lang }}
           path: output/
           if-no-files-found: error
+          retention-days: 7
 
       - name: Save topic history
         run: |

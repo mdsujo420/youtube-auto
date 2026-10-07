@@ -13,10 +13,14 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: generate-script
+  cancel-in-progress: false
+
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -24,7 +28,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install -r requirements.txt
+      - name: Install
+        run: |
+          for i in 1 2 3; do pip install -r requirements.txt && break || sleep 15; done
 
       - name: Pick language
         id: lang
@@ -38,15 +44,25 @@ jobs:
           else L=en; fi
           echo "lang=$L" >> "$GITHUB_OUTPUT"
 
-      - name: Generate script
+      - name: Generate script (retries up to 3 times)
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python generate_script.py --lang "${{ steps.lang.outputs.lang }}"
+          GEN_BUDGET_SECONDS: "720"
+          SCRIPT_LANG: ${{ steps.lang.outputs.lang }}
+        run: |
+          for i in 1 2 3; do
+            if python generate_script.py --lang "$SCRIPT_LANG"; then exit 0; fi
+            echo "run $i failed; waiting 3 minutes before retrying"
+            sleep 180
+          done
+          echo "All 3 runs failed"
+          exit 1
 
       - uses: actions/upload-artifact@v4
         with:
           name: script-${{ steps.lang.outputs.lang }}
           path: output/
+          if-no-files-found: error
 
       - name: Save topic history
         run: |
@@ -54,4 +70,6 @@ jobs:
           git config user.email "bot@users.noreply.github.com"
           git add history
           git commit -m "update topic history" || echo "nothing to commit"
-          git push
+          for i in 1 2 3; do
+            git pull --rebase && git push && break || sleep 10
+          done

@@ -9,6 +9,8 @@ Env:   GEMINI_API_KEY        (required)
        GEMINI_TTS_MODEL      (optional, comma list; default = auto-discover TTS models)
        GEMINI_VOICE          (optional prebuilt voice name, default Charon)
        TTS_STYLE             (optional style prefix; set to a single space to disable)
+       VOICE_CLEAN           (optional, 0 = keep raw audio; default 1 = trim tail hiss + fades)
+       VOICE_TAIL_THRESHOLD  (optional, default 0.12; raise to 0.2 to cut more of a quiet hiss)
        GEN_BUDGET_SECONDS    (optional total time budget, default 900)
 
 Robustness: busy/limited/unavailable models are skipped, rounds repeat with waiting,
@@ -18,11 +20,13 @@ no request exceeds the input-size limit (Bangla uses ~3 bytes per character).
 import argparse
 import base64
 import json
+import math
 import os
 import re
 import sys
 import time
 import wave
+from array import array
 from pathlib import Path
 
 import requests
@@ -36,6 +40,8 @@ FALLBACK_MODELS = ["gemini-2.5-flash-preview-tts", "gemini-2.5-flash-lite-previe
 MAX_CHUNK_BYTES = 3000   # service limit is about 4000 bytes per text field
 GAP_SECONDS = 0.35       # silence between segments
 MIN_AUDIO_SECONDS = 0.3
+CLEAN = os.environ.get("VOICE_CLEAN", "1") != "0"          # trim tail hiss + fades
+TAIL_RATIO = float(os.environ.get("VOICE_TAIL_THRESHOLD", "0.12"))  # raise (e.g. 0.2) to cut more
 
 
 # ----------------------------------------------------------------- text
@@ -169,6 +175,41 @@ def synth(text: str, headers: dict, candidates: list[str], deadline: float):
         time.sleep(wait)
 
 
+# ----------------------------------------------------------------- cleanup
+def clean_pcm(pcm: bytes, rate: int) -> bytes:
+    """Cut the quiet hiss/noise after the last spoken word (and any at the start),
+    then apply short fades so there are no clicks. 16-bit mono PCM in, same out."""
+    a = array("h")
+    a.frombytes(pcm[: len(pcm) // 2 * 2])
+    if sys.byteorder == "big":
+        a.byteswap()
+    frame = max(1, int(rate * 0.02))
+    n = len(a) // frame
+    if n < 5:
+        return pcm
+    rms = []
+    for i in range(n):
+        chunk = a[i * frame:(i + 1) * frame]
+        rms.append(math.sqrt(sum(x * x for x in chunk) / frame))
+    p90 = sorted(rms)[int(0.9 * (n - 1))]
+    thr = max(200.0, TAIL_RATIO * p90)
+    loud = [i for i, v in enumerate(rms) if v > thr]
+    if not loud:
+        return pcm
+    start = max(0, loud[0] * frame - int(rate * 0.05))
+    end = min(len(a), (loud[-1] + 1) * frame + int(rate * 0.12))
+    b = a[start:end]
+    fade_in, fade_out = int(rate * 0.01), int(rate * 0.08)
+    ln = len(b)
+    for i in range(min(fade_in, ln)):
+        b[i] = int(b[i] * i / fade_in)
+    for i in range(min(fade_out, ln)):
+        b[ln - 1 - i] = int(b[ln - 1 - i] * i / fade_out)
+    if sys.byteorder == "big":
+        b.byteswap()
+    return b.tobytes()
+
+
 # ----------------------------------------------------------------- wav
 def write_wav(path: Path, pcm: bytes, rate: int) -> None:
     with wave.open(str(path), "wb") as w:
@@ -230,6 +271,10 @@ def main() -> None:
             rate = r
         elif r != rate:
             sys.exit("Inconsistent sample rates between segments.")
+        if CLEAN:
+            cleaned = clean_pcm(pcm, rate)
+            print(f"segment {i}: cleaned {len(pcm) / (2 * rate):.2f}s -> {len(cleaned) / (2 * rate):.2f}s")
+            pcm = cleaned
         pcms.append(pcm)
 
     gap = b"\x00\x00" * int(rate * GAP_SECONDS)

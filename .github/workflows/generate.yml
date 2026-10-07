@@ -20,7 +20,7 @@ concurrency:
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -56,6 +56,22 @@ jobs:
             sleep 180
           done
           echo "All 3 runs failed"
+          exit 1
+
+      - name: Generate voiceover (retries up to 3 times)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEN_BUDGET_SECONDS: "900"
+          SCRIPT_LANG: ${{ steps.lang.outputs.lang }}
+        run: |
+          for i in 1 2 3; do
+            python generate_voice.py --lang "$SCRIPT_LANG" && exit 0
+            rc=$?
+            if [ "$rc" -eq 3 ]; then echo "Not retrying (quota used up or key invalid)"; exit 3; fi
+            echo "voice run $i failed; waiting 2 minutes before retrying"
+            sleep 120
+          done
+          echo "All 3 voice runs failed"
           exit 1
 
       - uses: actions/upload-artifact@v4

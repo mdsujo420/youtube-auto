@@ -1,14 +1,15 @@
 """Step 3: video (16:9 and 9:16) from free stock photos + the voiceover + captions.
 
-Usage: python generate_video.py --lang en|bn
-Reads:  output/script_<lang>.json, output/timings_<lang>.json, output/voice_<lang>.wav
-Writes: output/video_<lang>_16x9.mp4, output/video_<lang>_9x16.mp4, output/credits_<lang>.txt
+Usage: python generate_video.py --lang en|bn --kind long|short
+Reads:  output/timings_<lang>_<kind>.json, output/voice_<lang>_<kind>.wav
+Writes: output/video_<lang>_<kind>_<fmt>.mp4, output/credits_<lang>_<kind>.txt
+        long -> 16x9 (horizontal), short -> 9x16 (vertical) unless VIDEO_FORMATS says otherwise
 Needs:  ffmpeg (with libass) + fonts-noto-core, and at least one free image key:
         PIXABAY_API_KEY (https://pixabay.com/api/docs/ - shown after you log in) and/or
         PEXELS_API_KEY  (https://www.pexels.com/api/new/ - issuing new keys was paused when this was written)
 
 Env:   PIXABAY_API_KEY / PEXELS_API_KEY  (at least one; Pixabay is tried first)
-       VIDEO_FORMATS       (optional, default "16x9,9x16")
+       VIDEO_FORMATS       (optional; default 16x9 for long, 9x16 for short)
        VIDEO_PRESET / VIDEO_CRF  (optional x264 settings, default veryfast / 23)
 
 Each scene gets one stock photo (search = the scene's image_query) with a slow zoom for exactly
@@ -157,10 +158,10 @@ def gradient(path: Path, w: int, h: int, idx: int) -> None:
     )
 
 
-def fetch_images(segments: list[dict], fmt: str, lang: str, credits: dict) -> list[Path]:
+def fetch_images(segments: list[dict], fmt: str, tag: str, credits: dict) -> list[Path]:
     w, h = SIZES[fmt]
     dw, dh = int(w * HEADROOM) // 2 * 2, int(h * HEADROOM) // 2 * 2
-    folder = WORK / f"images_{lang}_{fmt}"
+    folder = WORK / f"images_{tag}_{fmt}"
     folder.mkdir(parents=True, exist_ok=True)
     used: set[int] = set()
     found: dict[str, list] = {}
@@ -181,6 +182,7 @@ def fetch_images(segments: list[dict], fmt: str, lang: str, credits: dict) -> li
             for q in query_variants(segments[i].get("image_query") or "abstract background"):
                 if q not in found:
                     found[q] = search_candidates(q, fmt)
+                    time.sleep(0.8)
                 for cand in found[q]:
                     if cand["id"] in used and not allow_reuse:
                         continue
@@ -256,10 +258,10 @@ def write_ass(path: Path, segments: list[dict], fmt: str, lang: str) -> None:
 
 
 # ----------------------------------------------------------------- ffmpeg
-def render(fmt: str, lang: str, segments: list[dict], images: list[Path], voice: Path, total: float) -> Path:
+def render(fmt: str, tag: str, lang: str, segments: list[dict], images: list[Path], voice: Path, total: float) -> Path:
     w, h = SIZES[fmt]
     dw, dh = int(w * HEADROOM) // 2 * 2, int(h * HEADROOM) // 2 * 2
-    ass = WORK / f"captions_{lang}_{fmt}.ass"
+    ass = WORK / f"captions_{tag}_{fmt}.ass"
     write_ass(ass, segments, fmt, lang)
 
     bounds = [0] + [int(round(s["end"] * FPS)) for s in segments]
@@ -281,7 +283,7 @@ def render(fmt: str, lang: str, segments: list[dict], images: list[Path], voice:
     graph = ";".join(chains) + ";" + "".join(f"[v{i}]" for i in range(k)) + f"concat=n={k}:v=1:a=0[vc];"
     graph += f"[vc]subtitles=filename={ass.name}[vout];[{k}:a]loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000[aout]"
 
-    out = (OUT / f"video_{lang}_{fmt}.mp4").resolve()
+    out = (OUT / f"video_{tag}_{fmt}.mp4").resolve()
     cmd = ["ffmpeg", "-y", "-loglevel", "error", *inputs, "-filter_complex", graph, "-map", "[vout]", "-map", "[aout]",
            "-c:v", "libx264", "-preset", PRESET, "-crf", CRF, "-pix_fmt", "yuv420p", "-r", str(FPS),
            "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", "-t", f"{total:.3f}", str(out)]
@@ -298,28 +300,32 @@ def render(fmt: str, lang: str, segments: list[dict], images: list[Path], voice:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--lang", choices=["en", "bn"], required=True)
-    lang = ap.parse_args().lang
+    ap.add_argument("--kind", choices=["long", "short"], required=True)
+    args = ap.parse_args()
+    lang, kind = args.lang, args.kind
+    tag = f"{lang}_{kind}"
 
     if not (PIXABAY_KEY or PEXELS_KEY):
         print("No image key found. Get a free Pixabay key (pixabay.com/api/docs, after logging in) and add it as the "
               "GitHub secret PIXABAY_API_KEY.")
         sys.exit(3)
-    for need in (f"script_{lang}.json", f"timings_{lang}.json", f"voice_{lang}.wav"):
+    for need in (f"timings_{tag}.json", f"voice_{tag}.wav"):
         if not (OUT / need).exists():
             sys.exit(f"{OUT / need} not found. Run the earlier steps first.")
     if subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode != 0:
         sys.exit("ffmpeg is not installed")
 
-    timings = json.loads((OUT / f"timings_{lang}.json").read_text(encoding="utf-8"))
+    timings = json.loads((OUT / f"timings_{tag}.json").read_text(encoding="utf-8"))
     segments = timings["segments"]
     total = float(timings["total_seconds"])
     WORK.mkdir(exist_ok=True)
-    formats = [f.strip() for f in os.environ.get("VIDEO_FORMATS", "16x9,9x16").split(",") if f.strip() in SIZES]
+    default_fmt = "16x9" if kind == "long" else "9x16"
+    formats = [f.strip() for f in os.environ.get("VIDEO_FORMATS", default_fmt).split(",") if f.strip() in SIZES]
 
     credits: dict = {}
     for fmt in formats:
-        images = fetch_images(segments, fmt, lang, credits)
-        render(fmt, lang, segments, images, OUT / f"voice_{lang}.wav", total)
+        images = fetch_images(segments, fmt, tag, credits)
+        render(fmt, tag, lang, segments, images, OUT / f"voice_{tag}.wav", total)
 
     lines = []
     if any(c["id"].startswith("pixabay") for c in credits.values()):
@@ -327,8 +333,8 @@ def main() -> None:
     if any(c["id"].startswith("pexels") for c in credits.values()):
         lines.append("Photos provided by Pexels (https://www.pexels.com)")
     lines += [c["credit"] for c in credits.values()]
-    (OUT / f"credits_{lang}.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"OK [{lang}] {len(formats)} video(s), {len(credits)} photos credited")
+    (OUT / f"credits_{tag}.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"OK [{tag}] {len(formats)} video(s), {len(credits)} photos credited")
 
 
 if __name__ == "__main__":

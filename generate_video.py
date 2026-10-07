@@ -3,9 +3,11 @@
 Usage: python generate_video.py --lang en|bn
 Reads:  output/script_<lang>.json, output/timings_<lang>.json, output/voice_<lang>.wav
 Writes: output/video_<lang>_16x9.mp4, output/video_<lang>_9x16.mp4, output/credits_<lang>.txt
-Needs:  ffmpeg (with libass) + fonts-noto-core, and a free PEXELS_API_KEY (https://www.pexels.com/api/new/)
+Needs:  ffmpeg (with libass) + fonts-noto-core, and at least one free image key:
+        PIXABAY_API_KEY (https://pixabay.com/api/docs/ - shown after you log in) and/or
+        PEXELS_API_KEY  (https://www.pexels.com/api/new/ - issuing new keys was paused when this was written)
 
-Env:   PEXELS_API_KEY      (required)
+Env:   PIXABAY_API_KEY / PEXELS_API_KEY  (at least one; Pixabay is tried first)
        VIDEO_FORMATS       (optional, default "16x9,9x16")
        VIDEO_PRESET / VIDEO_CRF  (optional x264 settings, default veryfast / 23)
 
@@ -30,15 +32,16 @@ WORK = Path("work")
 FPS = 25
 SIZES = {"16x9": (1920, 1080), "9x16": (1080, 1920)}
 ORIENT = {"16x9": "landscape", "9x16": "portrait"}
-KEY = os.environ.get("PEXELS_API_KEY", "").strip()
+PEXELS_KEY = os.environ.get("PEXELS_API_KEY", "").strip()
+PIXABAY_KEY = os.environ.get("PIXABAY_API_KEY", "").strip()
 PRESET = os.environ.get("VIDEO_PRESET", "veryfast")
 CRF = os.environ.get("VIDEO_CRF", "23")
 HEADROOM = 1.25  # source images are fetched 25% larger than the frame so the zoom stays sharp
 
 
-# ----------------------------------------------------------------- pexels
+# ----------------------------------------------------------------- image providers
 def pexels_search(query: str, orientation: str) -> list[dict]:
-    headers = {"Authorization": KEY}
+    headers = {"Authorization": PEXELS_KEY}
     params = {"query": query, "orientation": orientation, "per_page": 15, "size": "large"}
     for attempt in range(4):
         try:
@@ -62,6 +65,64 @@ def pexels_search(query: str, orientation: str) -> list[dict]:
         except ValueError:
             return []
     return []
+
+
+def pixabay_search(query: str, fmt: str) -> list[dict]:
+    """Pixabay free key: largest image offered is 1280 px (bigger sizes need Pixabay's approval)."""
+    vertical = fmt == "9x16"
+    params = {"key": PIXABAY_KEY, "q": query[:100], "image_type": "photo", "safesearch": "true",
+              "orientation": "vertical" if vertical else "horizontal", "per_page": 30}
+    for attempt in range(4):
+        try:
+            r = requests.get("https://pixabay.com/api/", params=params, timeout=30)
+        except requests.RequestException as e:
+            print(f"pixabay search error ({type(e).__name__}), retry")
+            time.sleep(5 * (attempt + 1))
+            continue
+        if r.status_code == 429:
+            print("Pixabay rate limit reached; waiting 60s")
+            time.sleep(60)
+            continue
+        if r.status_code in (400, 401, 403) and re.search(r"api key|invalid key|key", r.text, re.IGNORECASE):
+            print("The Pixabay API key is invalid. Check the PIXABAY_API_KEY secret.")
+            sys.exit(3)
+        if r.status_code != 200:
+            time.sleep(5 * (attempt + 1))
+            continue
+        try:
+            hits = r.json().get("hits", [])
+        except ValueError:
+            return []
+        need = ("imageHeight", 1280) if vertical else ("imageWidth", 1280)
+        hits.sort(key=lambda hh: 0 if hh.get(need[0], 0) >= need[1] else 1)  # sharp ones first (stable)
+        return [{"id": f"pixabay-{hh['id']}", "urls": [u for u in (hh.get("largeImageURL"), hh.get("webformatURL")) if u],
+                 "credit": f"Image by {hh.get('user', 'Pixabay user')} from Pixabay: {hh.get('pageURL', '')}"}
+                for hh in hits if hh.get("id")]
+    return []
+
+
+def pexels_candidates(query: str, fmt: str) -> list[dict]:
+    out = []
+    for photo in pexels_search(query, ORIENT[fmt]):
+        w, h = SIZES[fmt]
+        src = photo.get("src", {})
+        urls = []
+        if src.get("original"):
+            urls.append(f"{src['original']}?auto=compress&cs=tinysrgb&fit=crop&w={int(w * HEADROOM)}&h={int(h * HEADROOM)}")
+        urls += [src[k] for k in ("large2x", "large") if src.get(k)]
+        out.append({"id": f"pexels-{photo.get('id')}", "urls": urls,
+                    "credit": f"Photo by {photo.get('photographer', '')} on Pexels: {photo.get('url', '')}"})
+    return out
+
+
+def search_candidates(query: str, fmt: str) -> list[dict]:
+    """Candidates from every configured provider (Pixabay first, then Pexels)."""
+    out = []
+    if PIXABAY_KEY:
+        out += pixabay_search(query, fmt)
+    if PEXELS_KEY:
+        out += pexels_candidates(query, fmt)
+    return out
 
 
 def download(url: str, path: Path) -> bool:
@@ -110,31 +171,23 @@ def fetch_images(segments: list[dict], fmt: str, lang: str, credits: dict) -> li
         if path.exists():
             if meta.exists():
                 m = json.loads(meta.read_text(encoding="utf-8"))
-                credits[m["id"]] = m
-                used.add(m["id"])
+                if "credit" in m:
+                    credits[m["id"]] = m
+                    used.add(m["id"])
             paths.append(path)
             continue
         done = False
         for allow_reuse in (False, True):  # prefer a photo not used yet; reuse one before falling back to a gradient
             for q in query_variants(segments[i].get("image_query") or "abstract background"):
                 if q not in found:
-                    found[q] = pexels_search(q, ORIENT[fmt])
-                for photo in found[q]:
-                    pid = photo.get("id")
-                    if pid in used and not allow_reuse:
+                    found[q] = search_candidates(q, fmt)
+                for cand in found[q]:
+                    if cand["id"] in used and not allow_reuse:
                         continue
-                    src = photo.get("src", {})
-                    base = src.get("original")
-                    urls = []
-                    if base:
-                        urls.append(f"{base}?auto=compress&cs=tinysrgb&fit=crop&w={dw}&h={dh}")
-                    for k in ("large2x", "large"):
-                        if src.get(k):
-                            urls.append(src[k])
-                    if any(download(u, path) for u in urls):
-                        used.add(pid)
-                        info = {"id": pid, "photographer": photo.get("photographer", ""), "url": photo.get("url", "")}
-                        credits[pid] = info
+                    if any(download(u, path) for u in cand["urls"]):
+                        used.add(cand["id"])
+                        info = {"id": cand["id"], "credit": cand["credit"]}
+                        credits[cand["id"]] = info
                         meta.write_text(json.dumps(info), encoding="utf-8")
                         done = True
                         break
@@ -219,7 +272,7 @@ def render(fmt: str, lang: str, segments: list[dict], images: list[Path], voice:
         n = frames[i]
         z = f"1+0.10*on/{n}" if i % 2 == 0 else f"1.10-0.10*on/{n}"
         chains.append(
-            f"[{i}:v]scale={dw}:{dh}:force_original_aspect_ratio=increase,crop={dw}:{dh},setsar=1,"
+            f"[{i}:v]scale={dw}:{dh}:flags=lanczos:force_original_aspect_ratio=increase,crop={dw}:{dh},setsar=1,"
             f"zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={n}:s={w}x{h}:fps={FPS},"
             f"format=yuv420p[v{i}]"
         )
@@ -247,8 +300,9 @@ def main() -> None:
     ap.add_argument("--lang", choices=["en", "bn"], required=True)
     lang = ap.parse_args().lang
 
-    if not KEY:
-        print("PEXELS_API_KEY is not set. Get a free key at https://www.pexels.com/api/new/ and add it as a GitHub secret.")
+    if not (PIXABAY_KEY or PEXELS_KEY):
+        print("No image key found. Get a free Pixabay key (pixabay.com/api/docs, after logging in) and add it as the "
+              "GitHub secret PIXABAY_API_KEY.")
         sys.exit(3)
     for need in (f"script_{lang}.json", f"timings_{lang}.json", f"voice_{lang}.wav"):
         if not (OUT / need).exists():
@@ -267,8 +321,12 @@ def main() -> None:
         images = fetch_images(segments, fmt, lang, credits)
         render(fmt, lang, segments, images, OUT / f"voice_{lang}.wav", total)
 
-    lines = ["Photos provided by Pexels (https://www.pexels.com)"]
-    lines += [f"Photo by {c['photographer']} on Pexels: {c['url']}" for c in credits.values() if c.get("photographer")]
+    lines = []
+    if any(c["id"].startswith("pixabay") for c in credits.values()):
+        lines.append("Images from Pixabay (https://pixabay.com)")
+    if any(c["id"].startswith("pexels") for c in credits.values()):
+        lines.append("Photos provided by Pexels (https://www.pexels.com)")
+    lines += [c["credit"] for c in credits.values()]
     (OUT / f"credits_{lang}.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"OK [{lang}] {len(formats)} video(s), {len(credits)} photos credited")
 

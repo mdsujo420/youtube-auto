@@ -72,7 +72,7 @@ def list_candidates(headers: dict) -> list[str]:
     """Model names to try, newest flash first. GEMINI_MODEL overrides."""
     forced = os.environ.get("GEMINI_MODEL", "").strip()
     if forced:
-        return [forced]
+        return [m.strip() for m in forced.split(",") if m.strip()]
     r = requests.get(f"{API}?pageSize=200", headers=headers, timeout=60)
     r.raise_for_status()
     skip = ("lite", "image", "tts", "preview", "exp", "live", "thinking", "audio", "native", "robotics", "computer")
@@ -99,34 +99,34 @@ def call_gemini(prompt: str) -> dict:
         "generationConfig": {"responseMimeType": "application/json", "temperature": 1.0},
     }
     headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
-    for model in list_candidates(headers):
-        r = None
-        for attempt in range(2):
+    candidates = list_candidates(headers)
+    deadline = time.time() + 360  # give up after 6 minutes in total
+    for rnd in range(3):
+        for model in candidates:
+            if time.time() > deadline:
+                sys.exit("Gemini stayed busy for 6 minutes. Run again later.")
+            r = None
             try:
-                r = requests.post(f"{API}/{model}:generateContent", headers=headers, json=body, timeout=90)
+                r = requests.post(f"{API}/{model}:generateContent", headers=headers, json=body, timeout=60)
             except requests.RequestException as e:
-                print(f"model {model}: {type(e).__name__}, trying next")
-                r = None
-                break
-            if r.status_code == 429 and attempt == 0:
-                time.sleep(10)
+                print(f"[round {rnd + 1}] {model}: {type(e).__name__}, trying next")
                 continue
-            break
-        if r is None:
-            continue
-        if r.status_code in (403, 404, 429, 500, 502, 503, 504):
-            print(f"model {model}: HTTP {r.status_code}, trying next")
-            continue
-        r.raise_for_status()
-        try:
-            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
-            data = json.loads(text)
-        except (KeyError, IndexError, ValueError):
-            print(f"model {model}: unreadable answer, trying next")
-            continue
-        print(f"using model {model}")
-        return data
+            if r.status_code in (403, 404, 429, 500, 502, 503, 504):
+                print(f"[round {rnd + 1}] {model}: HTTP {r.status_code}, trying next")
+                continue
+            r.raise_for_status()
+            try:
+                text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+                data = json.loads(text)
+            except (KeyError, IndexError, ValueError):
+                print(f"[round {rnd + 1}] {model}: unreadable answer, trying next")
+                continue
+            print(f"using model {model}")
+            return data
+        if rnd < 2:
+            print("all models busy, waiting 20s and trying again")
+            time.sleep(20)
     sys.exit("No Gemini model worked (busy/timeout/quota). Run again in a few minutes.")
 
 

@@ -11,7 +11,8 @@ Env:   GEMINI_API_KEY        (required)
        TTS_STYLE             (optional style prefix; default empty so nothing but the script is spoken)
        VOICE_CLEAN           (optional, 0 = keep raw audio; default 1 = trim tail hiss + fades)
        VOICE_TAIL_THRESHOLD  (optional, default 0.12; raise to 0.2 to cut more of a quiet hiss)
-       VOICE_GATE_THRESHOLD  (optional, default 0.08; quiet parts below this share of speech level are lowered; 0 = off)
+       VOICE_GATE_THRESHOLD  (optional, default 0 = off; whole-segment hiss gate)
+       VOICE_TAIL_GATE       (optional, default 0.2; hiss gate for the last 0.8 s of each segment only; 0 = off)
        GEN_BUDGET_SECONDS    (optional total time budget, default 900)
 
 Robustness: busy/limited/unavailable models are skipped, rounds repeat with waiting,
@@ -43,7 +44,8 @@ GAP_SECONDS = 0.35       # silence between segments
 MIN_AUDIO_SECONDS = 0.3
 CLEAN = os.environ.get("VOICE_CLEAN", "1") != "0"          # trim tail hiss + fades
 TAIL_RATIO = float(os.environ.get("VOICE_TAIL_THRESHOLD", "0.12"))  # raise (e.g. 0.2) to cut more
-GATE_RATIO = float(os.environ.get("VOICE_GATE_THRESHOLD", "0.08"))  # quiet parts below this share of speech level are lowered
+GATE_RATIO = float(os.environ.get("VOICE_GATE_THRESHOLD", "0"))     # whole-segment gate; OFF by default (it can make speech sound rough)
+TAIL_GATE_RATIO = float(os.environ.get("VOICE_TAIL_GATE", "0.2"))   # gate applied ONLY to the last 0.8 s of each segment
 GATE_FLOOR = float(os.environ.get("VOICE_GATE_FLOOR", "0.08"))      # gain used in those quiet parts (0.08 = about -22 dB)
 
 
@@ -232,11 +234,16 @@ def clean_pcm(pcm: bytes, rate: int) -> bytes:
     if not loud:
         return pcm
     start = max(0, loud[0] * frame - int(rate * 0.05))
-    end = min(len(a), (loud[-1] + 1) * frame + int(rate * 0.12))
+    end = min(len(a), (loud[-1] + 1) * frame + int(rate * 0.06))
     b = a[start:end]
     if GATE_RATIO > 0:
         gate_quiet(b, rate, max(120.0, GATE_RATIO * p90))
-    fade_in, fade_out = int(rate * 0.01), int(rate * 0.08)
+    if TAIL_GATE_RATIO > 0 and len(b) > rate:
+        k = len(b) - int(rate * 0.8)
+        tail = b[k:]
+        gate_quiet(tail, rate, max(150.0, TAIL_GATE_RATIO * p90))
+        b[k:] = tail
+    fade_in, fade_out = int(rate * 0.01), int(rate * 0.10)
     ln = len(b)
     for i in range(min(fade_in, ln)):
         b[i] = int(b[i] * i / fade_in)

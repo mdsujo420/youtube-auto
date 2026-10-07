@@ -1,7 +1,5 @@
 name: generate-script
 
-name: generate-script
-
 on:
   workflow_dispatch:
     inputs:

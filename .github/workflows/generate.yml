@@ -1,11 +1,16 @@
 name: generate-script
 
+name: generate-script
+
 on:
   workflow_dispatch:
     inputs:
       lang:
         description: "en or bn"
         default: "en"
+      kinds:
+        description: "which videos: 'long short' (default), 'long' or 'short'"
+        default: "long short"
   schedule:
     - cron: "0 6 * * *"   # 06:00 UTC daily -> English
     - cron: "0 7 * * *"   # 07:00 UTC daily -> Bangla
@@ -20,7 +25,7 @@ concurrency:
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
 
@@ -39,77 +44,88 @@ jobs:
           done
           ffmpeg -version | head -1
 
-      - name: Pick language
-        id: lang
+      - name: Pick language and videos
+        id: pick
         env:
           EVENT: ${{ github.event_name }}
           SCHEDULE: ${{ github.event.schedule }}
           LANG_INPUT: ${{ github.event.inputs.lang }}
+          KINDS_INPUT: ${{ github.event.inputs.kinds }}
         run: |
-          if [ "$EVENT" = "workflow_dispatch" ]; then L="$LANG_INPUT"
-          elif [ "$SCHEDULE" = "0 7 * * *" ]; then L=bn
-          else L=en; fi
+          if [ "$EVENT" = "workflow_dispatch" ]; then L="$LANG_INPUT"; K="$KINDS_INPUT"
+          elif [ "$SCHEDULE" = "0 7 * * *" ]; then L=bn; K="long short"
+          else L=en; K="long short"; fi
+          [ -z "$K" ] && K="long short"
           echo "lang=$L" >> "$GITHUB_OUTPUT"
+          echo "kinds=$K" >> "$GITHUB_OUTPUT"
 
-      - name: Generate script (retries up to 3 times)
+      - name: Write scripts (long first, then the short on the same topic)
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEN_BUDGET_SECONDS: "720"
-          SCRIPT_LANG: ${{ steps.lang.outputs.lang }}
+          GEN_BUDGET_SECONDS: "1800"
+          SCRIPT_LANG: ${{ steps.pick.outputs.lang }}
+          KINDS: ${{ steps.pick.outputs.kinds }}
         run: |
-          for i in 1 2 3; do
-            if python generate_script.py --lang "$SCRIPT_LANG"; then exit 0; fi
-            echo "run $i failed; waiting 3 minutes before retrying"
-            sleep 180
-          done
-          echo "All 3 runs failed"
-          exit 1
+          retry() { local label="$1"; shift
+            for i in 1 2 3; do
+              "$@" && return 0
+              rc=$?
+              if [ "$rc" -eq 3 ]; then echo "Not retrying $label (key problem)"; return 3; fi
+              echo "$label failed (try $i); waiting 2 minutes"; sleep 120
+            done
+            return 1; }
+          for K in $KINDS; do retry "script $K" python generate_script.py --lang "$SCRIPT_LANG" --kind "$K" || exit $?; done
 
-      - name: Generate voiceover (retries up to 3 times)
+      - name: Generate voiceovers
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEN_BUDGET_SECONDS: "900"
-          SCRIPT_LANG: ${{ steps.lang.outputs.lang }}
+          GEN_BUDGET_SECONDS: "2400"
+          SCRIPT_LANG: ${{ steps.pick.outputs.lang }}
+          KINDS: ${{ steps.pick.outputs.kinds }}
         run: |
-          for i in 1 2 3; do
-            python generate_voice.py --lang "$SCRIPT_LANG" && exit 0
-            rc=$?
-            if [ "$rc" -eq 3 ]; then echo "Not retrying (quota used up or key invalid)"; exit 3; fi
-            echo "voice run $i failed; waiting 2 minutes before retrying"
-            sleep 120
-          done
-          echo "All 3 voice runs failed"
-          exit 1
+          retry() { local label="$1"; shift
+            for i in 1 2 3; do
+              "$@" && return 0
+              rc=$?
+              if [ "$rc" -eq 3 ]; then echo "Not retrying $label (quota or key problem)"; return 3; fi
+              echo "$label failed (try $i); waiting 2 minutes"; sleep 120
+            done
+            return 1; }
+          for K in $KINDS; do retry "voice $K" python generate_voice.py --lang "$SCRIPT_LANG" --kind "$K" || exit $?; done
 
-      - name: Generate videos (retries up to 3 times)
+      - name: Generate videos
         env:
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-          SCRIPT_LANG: ${{ steps.lang.outputs.lang }}
+          SCRIPT_LANG: ${{ steps.pick.outputs.lang }}
+          KINDS: ${{ steps.pick.outputs.kinds }}
         run: |
-          for i in 1 2 3; do
-            python generate_video.py --lang "$SCRIPT_LANG" && exit 0
-            rc=$?
-            if [ "$rc" -eq 3 ]; then echo "Not retrying (missing or invalid image key)"; exit 3; fi
-            echo "video run $i failed; waiting 1 minute before retrying"
-            sleep 60
-          done
-          echo "All 3 video runs failed"
-          exit 1
+          retry() { local label="$1"; shift
+            for i in 1 2 3; do
+              "$@" && return 0
+              rc=$?
+              if [ "$rc" -eq 3 ]; then echo "Not retrying $label (image key problem)"; return 3; fi
+              echo "$label failed (try $i); waiting 1 minute"; sleep 60
+            done
+            return 1; }
+          for K in $KINDS; do retry "video $K" python generate_video.py --lang "$SCRIPT_LANG" --kind "$K" || exit $?; done
 
       - uses: actions/upload-artifact@v4
         with:
-          name: script-${{ steps.lang.outputs.lang }}
-          path: output/
+          name: videos-${{ steps.pick.outputs.lang }}
+          path: |
+            output/*.mp4
+            output/*.json
+            output/credits_*.txt
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 3
 
-      - name: Save topic history
+      - name: Save topic history and speaking pace
         run: |
           git config user.name "bot"
           git config user.email "bot@users.noreply.github.com"
           git add history
-          git commit -m "update topic history" || echo "nothing to commit"
+          git commit -m "update topic history and pace" || echo "nothing to commit"
           for i in 1 2 3; do
             git pull --rebase && git push && break || sleep 10
           done

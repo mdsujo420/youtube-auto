@@ -57,6 +57,15 @@ jobs:
           echo "lang=$L" >> "$GITHUB_OUTPUT"
           echo "kinds=$K" >> "$GITHUB_OUTPUT"
 
+      - name: Find a trending topic
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          GEN_BUDGET_SECONDS: "300"
+          SCRIPT_LANG: ${{ steps.pick.outputs.lang }}
+        run: |
+          python discover_topic.py --lang "$SCRIPT_LANG" || echo "topic discovery failed; the script step picks a topic itself"
+
       - name: Write scripts (long first, then the short on the same topic)
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -108,13 +117,28 @@ jobs:
             return 1; }
           for K in $KINDS; do retry "video $K" python generate_video.py --lang "$SCRIPT_LANG" --kind "$K" || exit $?; done
 
+      - name: Thumbnails and upload kits
+        env:
+          SCRIPT_LANG: ${{ steps.pick.outputs.lang }}
+          KINDS: ${{ steps.pick.outputs.kinds }}
+        run: |
+          for K in $KINDS; do
+            for i in 1 2 3; do
+              python generate_package.py --lang "$SCRIPT_LANG" --kind "$K" && break
+              echo "package $K failed (try $i)"; sleep 20
+              [ "$i" -eq 3 ] && exit 1
+            done
+          done
+
       - uses: actions/upload-artifact@v4
         with:
           name: videos-${{ steps.pick.outputs.lang }}
           path: |
             output/*.mp4
+            output/*.jpg
             output/*.json
             output/credits_*.txt
+            output/upload_kit_*.txt
           if-no-files-found: error
           retention-days: 3
 

@@ -155,7 +155,7 @@ def call_gemini(prompt: str, headers: dict, candidates: list[str], deadline: flo
 
 
 # ----------------------------------------------------------------- prompts
-def outline_prompt(lang: str, kind: str, n: int, used: list[str], base: dict | None, feedback: str) -> str:
+def outline_prompt(lang: str, kind: str, n: int, used: list[str], base: dict | None, feedback: str, chosen: dict | None = None) -> str:
     name = LANGS[lang]
     fb = f"\nFix this from the previous attempt: {feedback}\n" if feedback else ""
     if base:
@@ -165,6 +165,10 @@ def outline_prompt(lang: str, kind: str, n: int, used: list[str], base: dict | N
             + "\n".join(f"- {s['heading']}: {'; '.join(s['points'])}" for s in base["sections"])
             + f"\nPick only the {n - 2} most surprising facts for the middle sections. Use a NEW hook, different from the long video."
         )
+    elif chosen:
+        topic_part = (f"Today's topic was chosen from trending signals: \"{chosen['topic']}\"."
+                      + (f" Suggested angle: {chosen['angle']}." if chosen.get("angle") else "")
+                      + "\nUse exactly this subject; take an original angle and never copy other videos' titles or wording.")
     else:
         topic_part = ("Pick ONE fresh topic (science, history, nature, space, human body, world records, geography).\n"
                       "Topics already used (do NOT repeat or paraphrase): " + ("; ".join(used[-80:]) or "none yet"))
@@ -221,10 +225,10 @@ Return ONLY JSON: {{"narration": str}}"""
 
 
 # ----------------------------------------------------------------- building blocks
-def get_outline(lang, kind, n, used, base, headers, cands, deadline):
+def get_outline(lang, kind, n, used, base, headers, cands, deadline, chosen=None):
     feedback = ""
     for attempt in range(1, 4):
-        data = call_gemini(outline_prompt(lang, kind, n, used, base, feedback), headers, cands, deadline)
+        data = call_gemini(outline_prompt(lang, kind, n, used, base, feedback, chosen), headers, cands, deadline)
         if data is None:
             return None
         secs = data.get("sections") if isinstance(data, dict) else None
@@ -321,6 +325,15 @@ def main() -> None:
         if base is None:
             print("no long script found: the short will pick its own topic")
 
+    chosen = None
+    tf = OUT / f"topic_{lang}.json"
+    if kind == "long" and tf.exists():
+        try:
+            chosen = json.loads(tf.read_text(encoding="utf-8"))
+            print(f"using the trending topic: {chosen['topic']}")
+        except (ValueError, KeyError):
+            chosen = None
+
     wps = load_wps(lang)
     n = cfg["sections"]
     target_words = int(cfg["target"] * wps)
@@ -344,7 +357,7 @@ def main() -> None:
 
     outline = cache.get("outline")
     if not outline:
-        outline = get_outline(lang, kind, n, used, base, headers, cands, deadline)
+        outline = get_outline(lang, kind, n, used, base, headers, cands, deadline, chosen)
         if outline is None:
             sys.exit("Could not get an outline from Gemini within the time budget. Run again later.")
         cache["outline"] = outline

@@ -140,7 +140,7 @@ jobs:
             output/credits_*.txt
             output/upload_kit_*.txt
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 1
 
       - name: Save topic history and speaking pace
         run: |
